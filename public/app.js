@@ -85,8 +85,8 @@
         body: JSON.stringify({ network, sizeGb: selectedPlan.sizeGb, recipient })
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.authorizationUrl) throw new Error(data.error || 'Checkout could not be started.');
-      location.assign(data.authorizationUrl);
+      if (!response.ok || !data.handoffUrl) throw new Error(data.error || 'Checkout could not be started.');
+      location.assign(data.handoffUrl);
     } catch (error) {
       showToast(error.message || 'Checkout could not be started.');
       button.disabled = false;

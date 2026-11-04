@@ -1,7 +1,7 @@
 const http=require('node:http'),crypto=require('node:crypto'),fs=require('node:fs'),path=require('node:path'),{Readable}=require('node:stream'),{PAYSTACK_PAYMENT_EMAILS,isAllowedPaystackPaymentEmail}=require('./payment-config'),ROOT=__dirname;
 const { createBundleRoute, handleBundleWebhook } = require('./bundle-service');
 const bundleRoute = createBundleRoute({
-  getBase: () => (process.env.SITE_B_BASE_URL || `http://127.0.0.1:${process.env.PORT || 4000}`).replace(/\/$/, ''),
+  getBase: () => normalizeBase(process.env.SITE_B_BASE_URL || `http://127.0.0.1:${process.env.PORT || 4000}`),
   pay: (...args) => pay(...args)
 });
 function servePublicSite(r,pathname){
@@ -40,7 +40,9 @@ http.createServer=(handler)=>createHttpServer(async(req,res)=>{
   return handler(req,res);
 });
 for(const l of(fs.existsSync(path.join(ROOT,'.env'))?fs.readFileSync(path.join(ROOT,'.env'),'utf8'):'').split(/\r?\n/)){const i=l.indexOf('=');if(i>0&&!l.trim().startsWith('#')&&process.env[l.slice(0,i).trim()]===undefined)process.env[l.slice(0,i).trim()]=l.slice(i+1).trim().replace(/^['"]|['"]$/g,'')}
-const PORT=+process.env.PORT||4000,BASE=(process.env.SITE_B_BASE_URL||`http://127.0.0.1:${PORT}`).replace(/\/$/,''),A=(process.env.SITE_A_BASE_URL||'').replace(/\/$/,''),AB=process.env.SITE_A_TO_SITE_B_SECRET||'',BA=process.env.SITE_B_TO_SITE_A_SECRET||'',configuredPaystackKey=process.env.PAYSTACK_SECRET_KEY||'',KEY=process.env.NODE_ENV==='development'?(process.env.PAYSTACK_TEST_SECRET_KEY||(/^sk_test_/.test(configuredPaystackKey)?configuredPaystackKey:'')):configuredPaystackKey,API=(process.env.PAYSTACK_API_BASE_URL||'https://api.paystack.co').replace(/\/$/,''),DATA=process.env.PAYMENT_DATA_FILE||path.join(ROOT,'data/payment-service.json'),PUBLIC_ROOT=path.join(ROOT,'public'),CALLBACK_RETRY_INTERVAL_MS=Math.max(10,Number(process.env.CALLBACK_RETRY_INTERVAL_MS)||30000),CALLBACK_RETRY_INITIAL_DELAY_MS=Math.max(10,Number(process.env.CALLBACK_RETRY_INITIAL_DELAY_MS)||30000),PAYMENT_RECONCILIATION_INTERVAL_MS=Math.max(10,Number(process.env.PAYMENT_RECONCILIATION_INTERVAL_MS)||60000),REQUEST_ID_RETENTION_MS=10*60*1000;
+const cleanEnv=value=>String(value??'').trim().replace(/^(['"])(.*)\1$/,'$2').trim();
+const normalizeBase=value=>cleanEnv(value).replace(/\/+$/,'');
+const PORT=+cleanEnv(process.env.PORT)||4000,BASE=normalizeBase(process.env.SITE_B_BASE_URL||`http://127.0.0.1:${PORT}`),A=normalizeBase(process.env.SITE_A_BASE_URL),AB=cleanEnv(process.env.SITE_A_TO_SITE_B_SECRET),BA=cleanEnv(process.env.SITE_B_TO_SITE_A_SECRET),configuredPaystackKey=cleanEnv(process.env.PAYSTACK_SECRET_KEY),testPaystackKey=cleanEnv(process.env.PAYSTACK_TEST_SECRET_KEY),KEY=testPaystackKey||configuredPaystackKey,API=normalizeBase(process.env.PAYSTACK_API_BASE_URL||'https://api.paystack.co'),DATA=cleanEnv(process.env.PAYMENT_DATA_FILE)||path.join(ROOT,'data/payment-service.json'),PUBLIC_ROOT=path.join(ROOT,'public'),CALLBACK_RETRY_INTERVAL_MS=Math.max(10,Number(cleanEnv(process.env.CALLBACK_RETRY_INTERVAL_MS))||30000),CALLBACK_RETRY_INITIAL_DELAY_MS=Math.max(10,Number(cleanEnv(process.env.CALLBACK_RETRY_INITIAL_DELAY_MS))||30000),PAYMENT_RECONCILIATION_INTERVAL_MS=Math.max(10,Number(cleanEnv(process.env.PAYMENT_RECONCILIATION_INTERVAL_MS))||60000),REQUEST_ID_RETENTION_MS=10*60*1000;
 const now=()=>new Date().toISOString();
 const id=p=>`${p}_${crypto.randomBytes(12).toString('hex')}`;
 const handoffToken=()=>crypto.randomBytes(32).toString('base64url');
@@ -73,8 +75,46 @@ function ensureHandoffToken(transaction,preferred=''){
   delete transaction.handoffToken;
   return {token,changed};
 }
+function ensureResultToken(transaction,preferred=''){
+  const decrypted=decryptHandoffToken(transaction.resultTokenCiphertext);
+  let token=validHandoffToken(preferred)?preferred:validHandoffToken(decrypted)?decrypted:'';
+  if(!token)token=handoffToken();
+  const hash=hashHandoffToken(token);
+  let changed=transaction.resultTokenHash!==hash;
+  if(!transaction.resultTokenCiphertext||decrypted!==token){transaction.resultTokenCiphertext=encryptHandoffToken(token);changed=true}
+  transaction.resultTokenHash=hash;
+  return {token,changed};
+}
 const eq=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));return x.length===y.length&&crypto.timingSafeEqual(x,y)};
 const read=async q=>{const c=[];for await(const x of q)c.push(x);return Buffer.concat(c)};
+
+function validHttpBase(value){
+  try{const u=new URL(String(value||''));return ['http:','https:'].includes(u.protocol)&&!u.username&&!u.password&&!u.search&&!u.hash}
+  catch{return false}
+}
+function configurationIssues(){
+  const issues=[];
+  if(!validHttpBase(BASE))issues.push('SITE_B_BASE_URL');
+  if(!validHttpBase(A))issues.push('SITE_A_BASE_URL');
+  if(!AB)issues.push('SITE_A_TO_SITE_B_SECRET');
+  if(!BA)issues.push('SITE_B_TO_SITE_A_SECRET');
+  if(!KEY)issues.push('PAYSTACK_SECRET_KEY');
+  if(!validHttpBase(API))issues.push('PAYSTACK_API_BASE_URL');
+  return issues;
+}
+function requestId(req){
+  const supplied=String(req.headers?.['x-request-id']||'');
+  return /^[A-Za-z0-9_-]{8,200}$/.test(supplied)?supplied:id('req');
+}
+function paymentError(res,status,code,message,correlationId){
+  return out(res,status,{error:message,code,requestId:correlationId});
+}
+function logPaymentFailure(fields){
+  const safe={event:'payment_failure',...fields};
+  delete safe.authorizationUrl;
+  delete safe.paystackReference;
+  console.error('[payment-service]',JSON.stringify(safe));
+}
 
 function load(){
   fs.mkdirSync(path.dirname(DATA),{recursive:true});
@@ -125,14 +165,15 @@ async function pay(route,o={}){
   if(!r.ok||!d.status)throw Error(d.message||'Paystack request failed');
   return d.data;
 }
-async function initializeProviderPayment(d,t){
+async function initializeProviderPayment(d,t,correlationId=''){
   t.status='INITIALIZING';
   t.initializationAttempts=Number(t.initializationAttempts||0)+1;
   t.lastInitializationAttemptAt=now();
   t.updatedAt=now();
+  const result=ensureResultToken(t);
   save(d);
   try{
-    const c=await pay('/transaction/initialize',{method:'POST',body:JSON.stringify({email:t.customerEmail,amount:t.amountMinor,currency:t.currency,reference:t.paystackReference,callback_url:BASE+'/payment/return?reference='+encodeURIComponent(t.paystackReference),metadata:{service:'SITE_B_PAYMENT_SERVICE',paymentServiceTransactionId:t.id}})});
+    const c=await pay('/transaction/initialize',{method:'POST',body:JSON.stringify({email:t.customerEmail,amount:t.amountMinor,currency:t.currency,reference:t.paystackReference,callback_url:BASE+'/payment/return?token='+encodeURIComponent(result.token),metadata:{service:'SITE_B_PAYMENT_SERVICE',paymentServiceTransactionId:t.id}})});
     if(!validPaystackAuthorizationUrl(c.authorization_url))throw Error('Payment provider returned an invalid authorization URL.');
     t.authorizationUrl=c.authorization_url;
     t.status='PENDING';
@@ -145,6 +186,7 @@ async function initializeProviderPayment(d,t){
     t.initializationLastError=String(error?.message||'Payment initialization failed').slice(0,240);
     t.updatedAt=now();
     save(d);
+    logPaymentFailure({code:'PAYSTACK_INITIALIZATION_FAILED',requestId:correlationId||undefined,transactionId:t.id,attempts:t.initializationAttempts,message:t.initializationLastError});
     throw error;
   }
 }
@@ -169,7 +211,6 @@ function adminStatus(t,p){
 function adminResult(t,p,callbackDelivered){
   return{ok:true,transactionId:t.id,siteATransactionId:t.siteATransactionId,paystackReference:t.paystackReference,status:t.status,paystackStatus:String(p.status||''),callbackDelivered,amountMinor:t.amountMinor,currency:t.currency};
 }
-function validReturnUrl(value){try{const u=new URL(String(value||''));return ['http:','https:'].includes(u.protocol)&&u.pathname==='/'&&u.searchParams.has('kyc_bypass_reference')?u.toString():''}catch{return ''}}
 function servePublic(r,pathname){const files={'/':'index.html','/index.html':'index.html','/styles.css':'styles.css','/app.js':'app.js'},name=files[pathname];if(!name)return false;const file=path.join(PUBLIC_ROOT,name);if(!fs.existsSync(file))return false;const type=name.endsWith('.css')?'text/css':name.endsWith('.js')?'text/javascript':'text/html';r.writeHead(200,{'content-type':`${type}; charset=utf-8`,'cache-control':name==='index.html'?'no-cache':'public, max-age=300','x-content-type-options':'nosniff'});r.end(fs.readFileSync(file));return true}
 const terminalPaymentStatuses=new Set(['SUCCESS','FAILED','EXPIRED']);
 function callbackDelivered(t){
@@ -327,11 +368,11 @@ async function handleAdminReconciliation(req,res,raw){
     return out(res,200,adminResult(t,payment,callbackDelivered));
   });
 }
-function page(t){const ref=typeof t==='string'?t:t.paystackReference,bypass=typeof t==='object'&&t.purpose==='KYC_BYPASS',amount=bypass?(t.amountMinor/100).toFixed(2):'',title=bypass?'GHS 70.00 KYC bypass payment':'Payment confirmation',copy=bypass?'Your withdrawal remains pending until Paystack confirms this exact GHS 70.00 payment. A successful confirmation auto-approves this withdrawal only; it does not verify your account.':'Your payment is being confirmed securely.';return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Payment confirmation</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f2f5f8;color:#16212b;font:16px system-ui}.box{width:min(420px,calc(100% - 42px));background:#fff;border:1px solid #dbe2e8;border-radius:18px;padding:34px}h1{font-size:12px;letter-spacing:.16em;color:#64748b}h2{font-size:27px;margin:.3em 0}p{line-height:1.55;color:#52616e}.amount{padding:13px;border-radius:9px;background:#fff8e8;color:#8a5c04;font-weight:800;font-size:20px}.ref{font:13px monospace;word-break:break-all;background:#f6f8fa;padding:12px;border-radius:8px;margin-top:12px}button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:9px;background:#164e63;color:#fff;font-weight:700;font-size:16px}.note{font-size:13px}</style><main class=box><h1>SECURE PAYSTACK CONFIRMATION</h1><h2>${title}</h2>${bypass?`<div class=amount>${t.currency} ${amount}</div>`:''}<p>${copy}</p><div class=ref>${ref}</div><button id=done>Check payment confirmation</button><p class=note id=msg></p></main><script>done.onclick=async()=>{done.disabled=true;msg.textContent='Checking Paystack confirmation…';let r=await fetch('/api/v1/payments/${encodeURIComponent(ref)}/complete',{method:'POST'}),d=await r.json();if(d.redirect)location.assign(d.redirect);else msg.textContent=d.message||'Payment is still being confirmed.';done.disabled=false}</script>`}
+function page(t,token){const safeToken=String(token).replace(/[^A-Za-z0-9_-]/g,'');return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Payment confirmation</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f2f5f8;color:#16212b;font:16px system-ui}.box{width:min(420px,calc(100% - 42px));background:#fff;border:1px solid #dbe2e8;border-radius:18px;padding:34px}h1{font-size:12px;letter-spacing:.16em;color:#64748b}h2{font-size:27px;margin:.3em 0}p{line-height:1.55;color:#52616e}button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:9px;background:#164e63;color:#fff;font-weight:700;font-size:16px}.note{font-size:13px}</style><main class=box><h1>SECURE PAYMENT</h1><h2>Payment confirmation</h2><p>Your payment status is being confirmed securely. You may close this window after the result appears.</p><button id=done>Check payment status</button><p class=note id=msg></p></main><script>const token=${JSON.stringify(safeToken)};done.onclick=async()=>{done.disabled=true;msg.textContent='Checking payment status…';try{let r=await fetch('/api/v1/payments/complete?token='+encodeURIComponent(token),{method:'POST'}),d=await r.json();msg.textContent=d.message||'Payment is still being confirmed.';if(d.status==='SUCCESS')msg.textContent='Payment confirmed successfully.';if(d.status==='FAILED'||d.status==='EXPIRED')msg.textContent='Payment was not completed.'}catch{msg.textContent='We could not check the payment right now.'}done.disabled=false};done.click()</script>`}
 async function route(q,r){
-  const u=new URL(q.url,BASE),d=load();
+  const u=new URL(q.url,BASE),d=load(),correlationId=requestId(q);
   try{
-    if(q.method==='GET'&&u.pathname==='/api/health')return out(r,200,{ok:true,paystackConfigured:!!KEY});
+    if(q.method==='GET'&&u.pathname==='/api/health')return out(r,200,{ok:true,paystackConfigured:!!KEY,configurationValid:configurationIssues().length===0,paystackMode:KEY&&/^sk_test_/.test(KEY)?'test':KEY?'live':'unconfigured'});
 
     if(q.method==='GET'&&u.pathname==='/payment/handoff'){
       const keys=[...u.searchParams.keys()],token=u.searchParams.get('token')||'';
@@ -347,26 +388,38 @@ async function route(q,r){
         const handoff=ensureHandoffToken(t,token);
         if(handoff.changed)save(current);
         const expiresAt=Date.parse(t.expiresAt);
+        if(t.handoffUsedAt)return out(r,410,{error:'Payment handoff has already been used.'});
         if(t.status!=='PENDING'||!Number.isFinite(expiresAt)||expiresAt<=Date.now()){
           if(t.status==='PENDING'&&(!Number.isFinite(expiresAt)||expiresAt<=Date.now())){t.status='EXPIRED';t.updatedAt=now();save(current)}
           if(terminalPaymentStatuses.has(t.status)&&!callbackDelivered(t))await notify(current,t,'handoff-status');
           return out(r,410,{error:'Payment handoff has expired.'});
         }
         if(!validPaystackAuthorizationUrl(t.authorizationUrl))return out(r,409,{error:'Payment handoff is not ready.'});
+        t.handoffUsedAt=now();
+        t.updatedAt=now();
+        save(current);
         r.writeHead(302,{'location':t.authorizationUrl,'cache-control':'no-store','referrer-policy':'no-referrer','x-content-type-options':'nosniff'});
         return r.end();
       });
     }
 
-    if(q.method==='GET'&&u.pathname==='/payment/return'){
-      const ref=u.searchParams.get('reference')||'';
-      if(!/^[A-Za-z0-9_-]{8,160}$/.test(ref))return out(r,400,{error:'Invalid payment reference.'});
-      r.writeHead(200,{'content-type':'text/html','cache-control':'no-store','referrer-policy':'no-referrer','x-content-type-options':'nosniff'});
-      return r.end(page(ref));
+    if(q.method==='GET'&&(u.pathname==='/payment/return'||u.pathname==='/payment/result')){
+      const token=u.searchParams.get('token')||'';
+      if(!validHandoffToken(token))return out(r,400,{error:'Invalid payment result.'});
+      const t=d.transactions.find(item=>item.resultTokenHash===hashHandoffToken(token));
+      if(!t)return out(r,404,{error:'Payment result was not found.'});
+      if(u.pathname==='/payment/return'){
+        r.writeHead(303,{'location':`${BASE}/payment/result?token=${encodeURIComponent(token)}`,'cache-control':'no-store','referrer-policy':'no-referrer','x-content-type-options':'nosniff'});
+        return r.end();
+      }
+      r.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store','referrer-policy':'no-referrer','x-content-type-options':'nosniff'});
+      return r.end(page(t,token));
     }
 
     if(q.method==='POST'&&u.pathname==='/api/v1/payments/initialize'){
       const b=await read(q);
+      const issues=configurationIssues();
+      if(issues.length)return paymentError(r,503,'PAYMENT_SERVICE_NOT_CONFIGURED','Secure payment checkout is not configured.',correlationId);
       if(!auth(q,b,AB))return out(r,401,{error:'Invalid Site A authentication.'});
       let p;
       try{p=JSON.parse(b)}catch{return out(r,400,{error:'Malformed request.'})}
@@ -377,8 +430,8 @@ async function route(q,r){
         let t=current.transactions.find(x=>x.siteATransactionId===p.siteATransactionId&&x.purpose===p.purpose);
         if(t){
           if(t.status==='INITIALIZING'&&Date.parse(t.expiresAt)>Date.now()){
-            try{await initializeProviderPayment(current,t)}
-            catch{return out(r,502,{error:'Payment initialization is pending reconciliation.'})}
+            try{await initializeProviderPayment(current,t,correlationId)}
+            catch{return paymentError(r,502,'PAYSTACK_INITIALIZATION_FAILED','Payment checkout could not be initialized. Your payment attempt was preserved for recovery.',correlationId)}
           }
           const expiresAt=Date.parse(t.expiresAt);
           if(t.status!=='PENDING'||!Number.isFinite(expiresAt)||expiresAt<=Date.now()){
@@ -386,22 +439,27 @@ async function route(q,r){
             return out(r,409,{error:'Payment session is no longer active.'});
           }
           if(!validPaystackAuthorizationUrl(t.authorizationUrl)){
-            try{await initializeProviderPayment(current,t)}
-            catch{return out(r,502,{error:'Payment initialization is pending reconciliation.'})}
+            try{await initializeProviderPayment(current,t,correlationId)}
+            catch{return paymentError(r,502,'PAYSTACK_INITIALIZATION_FAILED','Payment checkout could not be initialized. Your payment attempt was preserved for recovery.',correlationId)}
           }
           const handoff=ensureHandoffToken(t);
           if(handoff.changed)save(current);
           return out(r,200,{transactionId:t.id,handoffUrl:handoffUrl(handoff.token),expiresAt:t.expiresAt});
         }
         const lookup=p.purpose==='KYC_BYPASS'?'/api/v1/internal/kyc-bypass/lookup':'/api/v1/internal/topups/lookup';
-        const a=await call(lookup,{siteATransactionId:p.siteATransactionId});
-        if(a.userId!==p.siteAUserId||a.amountMinor!==p.amountMinor||a.currency!==p.currency||a.purpose!==p.purpose||!PAYSTACK_PAYMENT_EMAILS.includes(String(a.customer?.email||'').trim().toLowerCase())||a.customer.email.toLowerCase()!==p.customer.email.toLowerCase())return out(r,400,{error:'Payment data did not reconcile.'});
-        t={id:id('pay'),siteATransactionId:p.siteATransactionId,siteAUserId:p.siteAUserId,amountMinor:p.amountMinor,currency:p.currency,purpose:p.purpose,paystackReference:'SBP_'+crypto.randomBytes(16).toString('hex'),status:'INITIALIZING',expiresAt:a.expiresAt,createdAt:now(),updatedAt:now(),customerEmail:p.customer.email,returnUrl:p.purpose==='KYC_BYPASS'?validReturnUrl(p.returnUrl):''};
+        let a;
+        try{a=await call(lookup,{siteATransactionId:p.siteATransactionId})}
+        catch(error){
+          logPaymentFailure({code:'SITE_A_LOOKUP_FAILED',requestId:correlationId,message:String(error?.message||'Site A lookup failed').slice(0,240)});
+          return paymentError(r,502,'SITE_A_LOOKUP_FAILED','Payment details could not be validated. Your payment attempt remains available for recovery.',correlationId);
+        }
+        if(a.userId!==p.siteAUserId||a.amountMinor!==p.amountMinor||a.currency!==p.currency||a.purpose!==p.purpose||!PAYSTACK_PAYMENT_EMAILS.includes(String(a.customer?.email||'').trim().toLowerCase())||String(a.customer.email||'').toLowerCase()!==p.customer.email.toLowerCase())return paymentError(r,409,'PAYMENT_DATA_MISMATCH','Payment details did not reconcile.',correlationId);
+        t={id:id('pay'),siteATransactionId:p.siteATransactionId,siteAUserId:p.siteAUserId,amountMinor:p.amountMinor,currency:p.currency,purpose:p.purpose,paystackReference:'SBP_'+crypto.randomBytes(16).toString('hex'),status:'INITIALIZING',expiresAt:a.expiresAt,createdAt:now(),updatedAt:now(),customerEmail:p.customer.email};
         const handoff=ensureHandoffToken(t);
         current.transactions.push(t);
         save(current);
-        try{await initializeProviderPayment(current,t)}
-        catch{return out(r,502,{error:'Payment initialization is pending reconciliation.'})}
+        try{await initializeProviderPayment(current,t,correlationId)}
+        catch{return paymentError(r,502,'PAYSTACK_INITIALIZATION_FAILED','Payment checkout could not be initialized. Your payment attempt was preserved for recovery.',correlationId)}
         return out(r,201,{transactionId:t.id,handoffUrl:handoffUrl(handoff.token),expiresAt:t.expiresAt});
       });
     }
@@ -440,27 +498,29 @@ async function route(q,r){
       });
     }
 
-    if(q.method==='POST'&&/^\/api\/v1\/payments\/[^/]+\/complete$/.test(u.pathname)){
-      const t=d.transactions.find(x=>x.paystackReference===decodeURIComponent(u.pathname.split('/')[4]));
-      if(!t)return out(r,404,{error:'Payment session was not found.'});
+    if(q.method==='POST'&&u.pathname==='/api/v1/payments/complete'){
+      const token=u.searchParams.get('token')||'';
+      if(!validHandoffToken(token))return out(r,400,{error:'Invalid payment result.'});
+      const t=d.transactions.find(x=>x.resultTokenHash===hashHandoffToken(token));
+      if(!t)return out(r,404,{error:'Payment result was not found.'});
       return withPaymentTransactionLock(t.siteATransactionId,async()=>{
-        const current=load(),payment=current.transactions.find(x=>x.paystackReference===decodeURIComponent(u.pathname.split('/')[4]));
+        const current=load(),payment=current.transactions.find(x=>x.resultTokenHash===hashHandoffToken(token));
         if(!payment)return out(r,404,{error:'Payment session was not found.'});
-        await reconcile(current,payment);
-        const key=payment.purpose==='KYC_BYPASS'?'kyc_bypass_reference':'wallet_topup',value=payment.siteATransactionId;
-        if(payment.status==='SUCCESS'&&callbackDelivered(payment)){
-          if(payment.purpose==='KYC_BYPASS'&&payment.returnUrl)return out(r,200,{redirect:payment.returnUrl});
-          return out(r,200,{redirect:A+'/?'+key+'='+encodeURIComponent(value)});
+        try{await reconcile(current,payment)}catch(error){
+          logPaymentFailure({code:'PAYMENT_RECONCILIATION_FAILED',requestId:correlationId,transactionId:payment.id,message:String(error?.message||'Payment verification failed').slice(0,240)});
+          return paymentError(r,502,'PAYMENT_RECONCILIATION_FAILED','Payment status could not be confirmed yet. Please try again shortly.',correlationId);
         }
-        if(['FAILED','EXPIRED'].includes(payment.status)){
-          const origin=payment.purpose==='KYC_BYPASS'&&payment.returnUrl?new URL(payment.returnUrl).origin:A;
-          return out(r,200,{redirect:origin+'/?payment='+payment.status.toLowerCase()});
-        }
-        return out(r,202,{message:'Payment is still being confirmed. Please wait a moment.'});
+        if(payment.status==='SUCCESS'&&callbackDelivered(payment))return out(r,200,{status:'SUCCESS',message:'Payment confirmed successfully.'});
+        if(payment.status==='FAILED')return out(r,200,{status:'FAILED',message:'Payment was not completed.'});
+        if(payment.status==='EXPIRED')return out(r,200,{status:'EXPIRED',message:'Payment session expired.'});
+        return out(r,202,{status:'PENDING',message:'Payment is still being confirmed. Please try again shortly.'});
       });
     }
     return out(r,404,{error:'Not found.'});
-  }catch(e){out(r,500,{error:'Payment service could not process this request.'})}
+  }catch(e){
+    logPaymentFailure({code:'PAYMENT_SERVICE_INTERNAL_ERROR',requestId:correlationId,message:String(e?.message||'internal error').slice(0,240)});
+    paymentError(r,500,'PAYMENT_SERVICE_INTERNAL_ERROR','Payment service could not process this request.',correlationId);
+  }
 }
 const callbackRetryTimer=setInterval(()=>{retryPendingCallbacks().catch(()=>{})},CALLBACK_RETRY_INTERVAL_MS);
 const paymentReconciliationTimer=setInterval(()=>{reconcilePendingPayments().catch(()=>{})},PAYMENT_RECONCILIATION_INTERVAL_MS);

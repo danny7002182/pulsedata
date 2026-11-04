@@ -37,7 +37,7 @@ test('bundle checkout calculates Ghana network pricing and reconciles a paid ord
     pay: async (pathname, options) => {
       if (pathname === '/transaction/initialize') {
         initialized = JSON.parse(options.body);
-        return { authorization_url: 'https://paystack.test/checkout' };
+        return { authorization_url: 'https://checkout.paystack.com/test' };
       }
       assert.match(pathname, /^\/transaction\/verify\//);
       return {
@@ -58,14 +58,25 @@ test('bundle checkout calculates Ghana network pricing and reconciles a paid ord
     assert.equal(initialized.amount, 10000);
     assert.equal(initialized.currency, 'GHS');
     assert.ok(initializedResult.reference.startsWith('BNDL_'));
+    assert.equal(initializedResult.authorizationUrl, undefined);
+    assert.match(initializedResult.handoffUrl, /\/data\/payment\/handoff\?token=[A-Za-z0-9_-]{16,256}$/);
+
+    const handoffResponse = response();
+    await route(request('GET', new URL(initializedResult.handoffUrl).pathname + new URL(initializedResult.handoffUrl).search), handoffResponse);
+    assert.equal(handoffResponse.status, 302);
+    assert.equal(handoffResponse.headers.location, 'https://checkout.paystack.com/test');
+    const reusedHandoff = response();
+    await route(request('GET', new URL(initializedResult.handoffUrl).pathname + new URL(initializedResult.handoffUrl).search), reusedHandoff);
+    assert.equal(reusedHandoff.status, 410);
 
     const returnResponse = response();
-    await route(request('GET', `/data/payment/return?reference=${initializedResult.reference}&trxref=${initialized.reference}&reference=${initialized.reference}`), returnResponse);
-    assert.equal(returnResponse.status, 200);
-    assert.match(returnResponse.body, /Confirming your Paystack payment/);
+    const resultToken = new URL(initialized.callback_url).searchParams.get('token');
+    await route(request('GET', `/data/payment/return?token=${resultToken}`), returnResponse);
+    assert.equal(returnResponse.status, 303);
+    assert.doesNotMatch(returnResponse.headers.location, /reference|trxref/i);
 
     const completeResponse = response();
-    await route(request('POST', `/api/v1/data-bundles/${initializedResult.reference}/complete`), completeResponse);
+    await route(request('POST', `/api/v1/data-bundles/complete?token=${resultToken}`), completeResponse);
     assert.equal(completeResponse.status, 200);
     const completed = JSON.parse(completeResponse.body);
     assert.equal(completed.status, 'SUCCESS');

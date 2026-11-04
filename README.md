@@ -72,18 +72,69 @@ verifiable for recovery, but new transactions do not add those fields to
 Paystack. New provider references use the Site B-owned `SBP_` prefix; existing
 provider references are preserved for recovery.
 
-Site A payment initialization returns a Site B handoff URL rather than exposing
-the Paystack authorization URL to the browser. The handoff endpoint is:
+Site A payment initialization returns only a Site B handoff URL, the Site B
+transaction ID, and an expiry. It never returns the Paystack authorization URL
+to Site A or the browser. The handoff endpoint is:
 
 ```text
 GET /payment/handoff?token=<opaque-token>
 ```
 
-The token is short-lived and stored against the Site B payment transaction. Site
-B validates it, rejects unknown, expired, or terminal sessions, and redirects
-only to the stored HTTPS Paystack checkout URL with `Cache-Control: no-store`
-and `Referrer-Policy: no-referrer`. The handoff token contains no Site A
-transaction or user identifiers.
+The token is short-lived, stored only as a hash plus encrypted server-side
+ciphertext, and single-use. Site B validates it, rejects unknown, expired,
+terminal, or reused sessions, and redirects only to the stored HTTPS Paystack
+checkout URL with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+The result page uses a second opaque token and displays only a neutral success,
+failure, or pending message; it does not display Site A IDs, provider references,
+or Site A URLs.
+
+Site B's bundle storefront uses the same rule: its initialize response contains
+`reference`, `handoffUrl`, and `expiresAt`, never `authorizationUrl`. Bundle
+handoff and result endpoints are `/data/payment/handoff` and
+`/data/payment/return`.
+
+## Railway variables and webhook
+
+Site A must have exactly these payment variables (plus its normal application
+settings):
+
+```text
+APP_BASE_URL=https://<site-a-public-host>
+SITE_B_BASE_URL=https://<site-b-public-host>
+SITE_A_TO_SITE_B_SECRET=<same-value-as-Site-B>
+SITE_B_TO_SITE_A_SECRET=<same-value-as-Site-B>
+PAYSTACK_CURRENCY=GHS
+PAYMENT_SESSION_MINUTES=15
+```
+
+Site A must not have `PAYSTACK_SECRET_KEY`, `PAYSTACK_TEST_SECRET_KEY`, or
+`PAYSTACK_API_BASE_URL`.
+
+Site B must have exactly these payment variables (plus its storage and bundle
+settings):
+
+```text
+SITE_B_BASE_URL=https://<site-b-public-host>
+SITE_A_BASE_URL=https://<site-a-public-host>
+SITE_A_TO_SITE_B_SECRET=<byte-for-byte-same-value-as-Site-A>
+SITE_B_TO_SITE_A_SECRET=<byte-for-byte-same-value-as-Site-A>
+PAYSTACK_SECRET_KEY=sk_test_<Paystack-test-secret>
+PAYSTACK_API_BASE_URL=https://api.paystack.co
+PAYSTACK_CURRENCY=GHS
+PAYMENT_DATA_FILE=/app/data/payment-service.json
+DATA_BUNDLE_DATA_FILE=/app/data/data-bundles.json
+```
+
+Trim values, do not include quotes or trailing slashes, and restart both
+services after changing them. The Paystack webhook URL is:
+
+```text
+https://<site-b-public-host>/api/v1/webhooks/paystack
+```
+
+Both public hosts and the Paystack webhook must be reachable over HTTPS. The
+callback URL sent to Paystack is generated privately by Site B and contains an
+opaque result token, not a Site A or provider reference.
 
 ## Railway storage
 

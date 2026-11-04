@@ -13,6 +13,9 @@ const PAYMENT_WINDOW_MS = 15 * 60 * 1000;
 
 const now = () => new Date().toISOString();
 const makeId = (prefix) => `${prefix}_${crypto.randomBytes(12).toString('hex')}`;
+const makeOpaqueToken = () => crypto.randomBytes(32).toString('base64url');
+const hashToken = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex');
+const validOpaqueToken = (value) => /^[A-Za-z0-9_-]{16,256}$/.test(String(value || ''));
 const safeText = (value, max = 200) => String(value || '').trim().slice(0, max);
 
 function filePath() {
@@ -77,9 +80,9 @@ function orderView(order) {
   };
 }
 
-function paymentPage(reference) {
-  const escaped = String(reference).replace(/[^A-Za-z0-9_-]/g, '');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Confirm bundle payment</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fbfaf7;color:#1e2421;font:15px system-ui,-apple-system,sans-serif}.box{width:min(430px,calc(100% - 42px));background:#fff;border:1px solid #e8e6df;border-radius:18px;padding:34px;box-shadow:0 20px 60px rgba(26,43,36,.1)}.mark{width:48px;height:48px;display:grid;place-items:center;border-radius:14px;background:#d6e45a;color:#183f35;font-size:25px;font-weight:800}h1{font-size:11px;letter-spacing:.15em;color:#235c4b;margin:25px 0 9px}h2{font-size:27px;line-height:1.1;margin:0 0 13px;letter-spacing:-.05em}p{line-height:1.6;color:#78807b}.ref{font:12px monospace;word-break:break-all;background:#f1f0eb;padding:12px;border-radius:8px;margin-top:16px}button{width:100%;margin-top:20px;padding:14px;border:0;border-radius:8px;background:#235c4b;color:#fff;font-weight:700;font-size:15px;cursor:pointer}.note{font-size:12px;text-align:center;margin-bottom:0}</style></head><body><main class="box"><div class="mark">↗</div><h1>SECURE BUNDLE PAYMENT</h1><h2>Confirming your Paystack payment</h2><p>Your payment is being reconciled securely. You can continue when Paystack has completed the transaction.</p><div class="ref">${escaped}</div><button id="check" type="button">Check payment status</button><p class="note" id="message"></p></main><script>const reference=${JSON.stringify(escaped)};const check=document.getElementById('check'),message=document.getElementById('message');async function confirmPayment(){check.disabled=true;message.textContent='Checking Paystack…';try{const response=await fetch('/api/v1/data-bundles/'+encodeURIComponent(reference)+'/complete',{method:'POST'});const data=await response.json();if(data.status==='SUCCESS'){location.assign('/?bundle_order='+encodeURIComponent(reference));return}if(data.status==='FAILED'||data.status==='EXPIRED'){location.assign('/?bundle_payment='+data.status.toLowerCase());return}message.textContent=data.message||'Payment is still pending. Try again in a moment.'}catch{message.textContent='We could not check the payment right now.'}check.disabled=false}check.addEventListener('click',confirmPayment);confirmPayment();</script></body></html>`;
+function paymentPage(token) {
+  const escaped = String(token).replace(/[^A-Za-z0-9_-]/g, '');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Confirm payment</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fbfaf7;color:#1e2421;font:15px system-ui,-apple-system,sans-serif}.box{width:min(430px,calc(100% - 42px));background:#fff;border:1px solid #e8e6df;border-radius:18px;padding:34px;box-shadow:0 20px 60px rgba(26,43,36,.1)}.mark{width:48px;height:48px;display:grid;place-items:center;border-radius:14px;background:#d6e45a;color:#183f35;font-size:25px;font-weight:800}h1{font-size:11px;letter-spacing:.15em;color:#235c4b;margin:25px 0 9px}h2{font-size:27px;line-height:1.1;margin:0 0 13px;letter-spacing:-.05em}p{line-height:1.6;color:#78807b}button{width:100%;margin-top:20px;padding:14px;border:0;border-radius:8px;background:#235c4b;color:#fff;font-weight:700;font-size:15px;cursor:pointer}.note{font-size:12px;text-align:center;margin-bottom:0}</style></head><body><main class="box"><div class="mark">↗</div><h1>SECURE PAYMENT</h1><h2>Payment confirmation</h2><p>Your payment is being reconciled securely. You can continue when the result appears.</p><button id="check" type="button">Check payment status</button><p class="note" id="message"></p></main><script>const token=${JSON.stringify(escaped)};const check=document.getElementById('check'),message=document.getElementById('message');async function confirmPayment(){check.disabled=true;message.textContent='Checking payment status…';try{const response=await fetch('/api/v1/data-bundles/complete?token='+encodeURIComponent(token),{method:'POST'});const data=await response.json();if(data.status==='SUCCESS'){location.assign('/?bundle_order='+encodeURIComponent(data.order.reference));return}if(data.status==='FAILED'||data.status==='EXPIRED'){message.textContent='Payment was not completed.';return}message.textContent=data.message||'Payment is still pending. Try again in a moment.'}catch{message.textContent='We could not check the payment right now.'}check.disabled=false}check.addEventListener('click',confirmPayment);confirmPayment();</script></body></html>`;
 }
 
 function adminAuthorized(req) {
@@ -100,6 +103,22 @@ function networkOrder(body) {
   return { network, sizeGb, recipient, amountMinor };
 }
 
+function validPaystackAuthorizationUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' && url.hostname === 'checkout.paystack.com' && !url.username && !url.password && !url.hash;
+  } catch { return false; }
+}
+
+function requestId(req) {
+  const value = String(req.headers['x-request-id'] || '');
+  return /^[A-Za-z0-9_-]{8,200}$/.test(value) ? value : makeId('req');
+}
+
+function paymentError(res, status, code, message, correlationId) {
+  return json(res, status, { error: message, code, requestId: correlationId });
+}
+
 function matchingPayment(order, payment) {
   const metadata = payment.metadata || {};
   return payment.reference === order.paystackReference
@@ -114,17 +133,37 @@ function createBundleRoute({ getBase, pay }) {
     const url = new URL(req.url, getBase());
     const pathname = url.pathname;
     const store = loadStore();
+    const correlationId = requestId(req);
 
     if (req.method === 'GET' && pathname === '/data/payment/return') {
-      let reference = url.searchParams.get('reference') || '';
-      if (!/^BNDL_[A-Za-z0-9_-]{16,100}$/.test(reference)) {
-        const paystackReference = url.searchParams.get('trxref') || reference;
-        const matchingOrder = store.orders.find((item) => item.paystackReference === paystackReference);
-        reference = matchingOrder?.reference || '';
-      }
-      if (!/^BNDL_[A-Za-z0-9_-]{16,100}$/.test(reference)) return json(res, 400, { error: 'Invalid bundle payment reference.' });
+      const token = url.searchParams.get('token') || '';
+      const order = store.orders.find((item) => item.resultTokenHash === hashToken(token));
+      if (!validOpaqueToken(token) || !order) return json(res, 400, { error: 'Invalid payment result.' });
+      res.writeHead(303, { location: `${getBase().replace(/\/+$/, '')}/data/payment/result?token=${encodeURIComponent(token)}`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' });
+      res.end();
+      return true;
+    }
+
+    if (req.method === 'GET' && pathname === '/data/payment/result') {
+      const token = url.searchParams.get('token') || '';
+      const order = store.orders.find((item) => item.resultTokenHash === hashToken(token));
+      if (!validOpaqueToken(token) || !order) return json(res, 404, { error: 'Payment result was not found.' });
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-      res.end(paymentPage(reference));
+      res.end(paymentPage(token));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathname === '/data/payment/handoff') {
+      const token = url.searchParams.get('token') || '';
+      const order = store.orders.find((item) => item.handoffTokenHash === hashToken(token));
+      if (!validOpaqueToken(token) || !order) return json(res, 404, { error: 'Payment handoff was not found.' });
+      if (order.handoffUsedAt) return json(res, 410, { error: 'Payment handoff has already been used.' });
+      if (order.paymentStatus !== 'PENDING' || Date.parse(order.expiresAt) <= Date.now() || !validPaystackAuthorizationUrl(order.authorizationUrl)) return json(res, 410, { error: 'Payment handoff has expired.' });
+      order.handoffUsedAt = now();
+      order.updatedAt = now();
+      saveStore(store);
+      res.writeHead(302, { location: order.authorizationUrl, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' });
+      res.end();
       return true;
     }
 
@@ -137,32 +176,46 @@ function createBundleRoute({ getBase, pay }) {
       if (!validEmail(email)) return json(res, 503, { error: 'Bundle payment email is not configured.' });
       const reference = makeId('BNDL');
       const paystackReference = makeId('PBD');
+      const handoffToken = makeOpaqueToken();
+      const resultToken = makeOpaqueToken();
       const order = {
         reference, paystackReference, ...details, currency: CURRENCY, paymentProvider: 'paystack',
         paymentStatus: 'PENDING', status: 'PAYMENT_INITIALIZED', fulfillmentStatus: 'AWAITING_PAYMENT',
-        customerEmail: email, createdAt: now(), updatedAt: now(), expiresAt: new Date(Date.now() + PAYMENT_WINDOW_MS).toISOString()
+        customerEmail: email, handoffTokenHash: hashToken(handoffToken), resultTokenHash: hashToken(resultToken),
+        createdAt: now(), updatedAt: now(), expiresAt: new Date(Date.now() + PAYMENT_WINDOW_MS).toISOString()
       };
+      store.orders.push(order);
+      saveStore(store);
       try {
         const payment = await pay('/transaction/initialize', {
           method: 'POST',
           body: JSON.stringify({
             email, amount: order.amountMinor, currency: CURRENCY, reference: paystackReference,
-            callback_url: `${getBase()}/data/payment/return?reference=${encodeURIComponent(reference)}`,
+            callback_url: `${getBase().replace(/\/+$/, '')}/data/payment/return?token=${encodeURIComponent(resultToken)}`,
             metadata: { service: 'PULSE_DATA', orderReference: reference, network: details.network, sizeGb: details.sizeGb }
           })
         });
+        if (!validPaystackAuthorizationUrl(payment.authorization_url)) throw new Error('Payment provider returned an invalid checkout URL.');
         order.authorizationUrl = payment.authorization_url;
-        store.orders.push(order);
         saveStore(store);
-        return json(res, 201, { reference, authorizationUrl: order.authorizationUrl, expiresAt: order.expiresAt });
+        return json(res, 201, { reference, handoffUrl: `${getBase().replace(/\/+$/, '')}/data/payment/handoff?token=${encodeURIComponent(handoffToken)}`, expiresAt: order.expiresAt });
       } catch (error) {
-        return json(res, 502, { error: error.message || 'Bundle payment could not be initialized.' });
+        order.paymentStatus = 'INITIALIZATION_FAILED';
+        order.status = 'PAYMENT_INITIALIZATION_FAILED';
+        order.updatedAt = now();
+        order.initializationError = String(error?.message || 'Bundle payment could not be initialized.').slice(0, 240);
+        saveStore(store);
+        console.error('[bundle-payment]', JSON.stringify({ event: 'payment_failure', code: 'PAYSTACK_INITIALIZATION_FAILED', requestId: correlationId, orderReference: reference, message: order.initializationError }));
+        return paymentError(res, 502, 'PAYSTACK_INITIALIZATION_FAILED', 'Payment checkout could not be initialized. Your order was preserved for recovery.', correlationId);
       }
     }
 
     const completeMatch = pathname.match(/^\/api\/v1\/data-bundles\/(BNDL_[A-Za-z0-9_-]{16,100})\/complete$/);
-    if (req.method === 'POST' && completeMatch) {
-      const order = store.orders.find((item) => item.reference === completeMatch[1]);
+    if (req.method === 'POST' && (completeMatch || pathname === '/api/v1/data-bundles/complete')) {
+      const token = url.searchParams.get('token') || '';
+      const order = completeMatch
+        ? store.orders.find((item) => item.reference === completeMatch[1])
+        : store.orders.find((item) => item.resultTokenHash === hashToken(token));
       if (!order) return json(res, 404, { error: 'Bundle order was not found.' });
       if (order.paymentStatus === 'SUCCESS') return json(res, 200, { status: 'SUCCESS', order: orderView(order) });
       if (['FAILED', 'EXPIRED'].includes(order.paymentStatus)) return json(res, 200, { status: order.paymentStatus, order: orderView(order) });

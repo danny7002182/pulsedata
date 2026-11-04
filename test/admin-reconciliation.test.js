@@ -51,7 +51,7 @@ function transaction(overrides = {}) {
     expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    customerEmail: 'bridgetfegerson2007+1@gmail.com',
+    customerEmail: 'bridgetfegerson2007+11@gmail.com',
     returnUrl: '',
     authorizationUrl: 'https://checkout.paystack.com/test',
     ...overrides
@@ -94,7 +94,7 @@ async function request(base, body, headers = signedHeaders(body)) {
   return { response, body: await response.json() };
 }
 
-async function startFixture({ storedTransaction = transaction(), paystackPayment: configuredPayment, callbackFailures = 0, initializeFailures = 0, initializeDelayMs = 0, callbackRetryIntervalMs, paymentReconciliationIntervalMs } = {}) {
+async function startFixture({ storedTransaction = transaction(), paystackPayment: configuredPayment, callbackFailures = 0, initializeFailures = 0, initializeDelayMs = 0, callbackRetryIntervalMs, paymentReconciliationIntervalMs, envOverrides = {} } = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-admin-reconcile-'));
   const dataFile = path.join(tempDir, 'payment-service.json');
   const bundleFile = path.join(tempDir, 'data-bundles.json');
@@ -141,7 +141,7 @@ async function startFixture({ storedTransaction = transaction(), paystackPayment
         amountMinor: isKyc ? 7000 : body.siteATransactionId === 'PH-TOPUP-INIT-001' ? 4200 : 18000,
         currency: 'GHS',
         purpose: isKyc ? 'KYC_BYPASS' : 'WALLET_TOPUP',
-        customer: { email: 'bridgetfegerson2007+1@gmail.com' },
+        customer: { email: 'bridgetfegerson2007+11@gmail.com' },
         expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString()
       });
     }
@@ -167,7 +167,8 @@ async function startFixture({ storedTransaction = transaction(), paystackPayment
       DATA_BUNDLE_DATA_FILE: bundleFile,
       DATA_BUNDLE_PAYMENT_EMAIL: storedTransaction.customerEmail,
       ...(callbackRetryIntervalMs ? { CALLBACK_RETRY_INTERVAL_MS: String(callbackRetryIntervalMs), CALLBACK_RETRY_INITIAL_DELAY_MS: String(callbackRetryIntervalMs) } : {}),
-      ...(paymentReconciliationIntervalMs ? { PAYMENT_RECONCILIATION_INTERVAL_MS: String(paymentReconciliationIntervalMs) } : {})
+      ...(paymentReconciliationIntervalMs ? { PAYMENT_RECONCILIATION_INTERVAL_MS: String(paymentReconciliationIntervalMs) } : {}),
+      ...envOverrides
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -234,7 +235,7 @@ test('authenticated Site A request IDs cannot be replayed', async () => {
       amountMinor: 4200,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const headers = signedHeaders(body, 'site-a-request-id-replay');
     const first = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
@@ -274,7 +275,7 @@ test('request-ID claims survive concurrent operations for different transactions
       amountMinor: 18000,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const initializeHeaders = signedHeaders(initializeBody, 'site-a-cross-transaction-init');
     const initialization = fetch(`${fixture.base}/api/v1/payments/initialize`, {
@@ -307,7 +308,7 @@ test('Site A initialization sends only Site B-owned metadata to Paystack', async
       amountMinor: 4200,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const response = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
       method: 'POST',
@@ -339,6 +340,92 @@ test('Site A initialization sends only Site B-owned metadata to Paystack', async
     assert.equal(handoffResponse.headers.get('location'), 'https://checkout.paystack.com/test');
     assert.equal(handoffResponse.headers.get('cache-control'), 'no-store');
     assert.equal(handoffResponse.headers.get('referrer-policy'), 'no-referrer');
+    const callbackUrl = new URL(fixture.initializeBodies[0].callback_url);
+    assert.equal(callbackUrl.pathname, '/payment/return');
+    assert.equal([...callbackUrl.searchParams.keys()].length, 1);
+    assert.match(callbackUrl.searchParams.get('token'), /^[A-Za-z0-9_-]{16,256}$/);
+    assert.doesNotMatch(fixture.initializeBodies[0].callback_url, /reference|trxref|PH-TOPUP|SITE_A/i);
+    const resultPage = await fetch(callbackUrl, { redirect: 'manual' });
+    assert.equal(resultPage.status, 303);
+    assert.doesNotMatch(resultPage.headers.get('location'), /reference|trxref|PH-TOPUP|SITE_A/i);
+    const page = await fetch(resultPage.headers.get('location'));
+    const pageText = await page.text();
+    assert.doesNotMatch(pageText, /PCS_|PH-TOPUP|SITE_A|checkout\.paystack\.com|authorizationUrl/i);
+  } finally {
+    await fixture.stop();
+  }
+});
+
+test('active handoff tokens are single-use', async () => {
+  const fixture = await startFixture();
+  try {
+    const body = JSON.stringify({
+      siteATransactionId: 'PH-TOPUP-INIT-001', siteAUserId: 'usr_init_001', amountMinor: 4200,
+      currency: 'GHS', purpose: 'WALLET_TOPUP', customer: { email: 'bridgetfegerson2007+11@gmail.com' }
+    });
+    const initialized = await fetch(`${fixture.base}/api/v1/payments/initialize`, { method: 'POST', headers: signedHeaders(body, 'site-a-handoff-single-use'), body });
+    const result = await initialized.json();
+    const first = await fetch(result.handoffUrl, { redirect: 'manual' });
+    const second = await fetch(result.handoffUrl, { redirect: 'manual' });
+    assert.equal(first.status, 302);
+    assert.equal(second.status, 410);
+  } finally {
+    await fixture.stop();
+  }
+});
+
+test('missing Site A configuration returns a safe correlated error', async () => {
+  const fixture = await startFixture({ envOverrides: { SITE_A_BASE_URL: '' } });
+  try {
+    const body = JSON.stringify({
+      siteATransactionId: 'PH-TOPUP-INIT-001', siteAUserId: 'usr_init_001', amountMinor: 4200,
+      currency: 'GHS', purpose: 'WALLET_TOPUP', customer: { email: 'bridgetfegerson2007+11@gmail.com' }
+    });
+    const response = await fetch(`${fixture.base}/api/v1/payments/initialize`, { method: 'POST', headers: signedHeaders(body, 'site-a-missing-site-a-url'), body });
+    const result = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(result.code, 'PAYMENT_SERVICE_NOT_CONFIGURED');
+    assert.equal(result.requestId, 'site-a-missing-site-a-url');
+    assert.equal(fixture.initializeRequests.length, 0);
+  } finally {
+    await fixture.stop();
+  }
+});
+
+test('missing or mismatched shared secrets fail closed', async () => {
+  const missing = await startFixture({ envOverrides: { SITE_A_TO_SITE_B_SECRET: '' } });
+  try {
+    const body = JSON.stringify({ siteATransactionId: 'PH-TOPUP-INIT-001' });
+    const response = await fetch(`${missing.base}/api/v1/payments/initialize`, { method: 'POST', headers: signedHeaders(body, 'site-a-missing-secret'), body });
+    const result = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(result.code, 'PAYMENT_SERVICE_NOT_CONFIGURED');
+  } finally {
+    await missing.stop();
+  }
+
+  const mismatched = await startFixture({ envOverrides: { SITE_A_TO_SITE_B_SECRET: 'different-secret-value' } });
+  try {
+    const body = JSON.stringify({ siteATransactionId: 'PH-TOPUP-INIT-001' });
+    const response = await fetch(`${mismatched.base}/api/v1/payments/initialize`, { method: 'POST', headers: signedHeaders(body, 'site-a-mismatched-secret'), body });
+    assert.equal(response.status, 401);
+  } finally {
+    await mismatched.stop();
+  }
+});
+
+test('missing Paystack configuration returns a safe correlated error', async () => {
+  const fixture = await startFixture({ envOverrides: { PAYSTACK_SECRET_KEY: '', PAYSTACK_TEST_SECRET_KEY: '' } });
+  try {
+    const body = JSON.stringify({
+      siteATransactionId: 'PH-TOPUP-INIT-001', siteAUserId: 'usr_init_001', amountMinor: 4200,
+      currency: 'GHS', purpose: 'WALLET_TOPUP', customer: { email: 'bridgetfegerson2007+11@gmail.com' }
+    });
+    const response = await fetch(`${fixture.base}/api/v1/payments/initialize`, { method: 'POST', headers: signedHeaders(body, 'site-a-missing-paystack'), body });
+    const result = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(result.code, 'PAYMENT_SERVICE_NOT_CONFIGURED');
+    assert.equal(fixture.initializeRequests.length, 0);
   } finally {
     await fixture.stop();
   }
@@ -363,7 +450,7 @@ test('payment handoff rejects malformed, unknown, and terminal tokens', async ()
       amountMinor: 4200,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const initialized = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
       method: 'POST',
@@ -419,7 +506,7 @@ test('concurrent initialization reuses one Site B transaction and one Paystack p
       amountMinor: 4200,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const [first, second] = await Promise.all([
       fetch(`${fixture.base}/api/v1/payments/initialize`, {
@@ -454,7 +541,7 @@ test('KYC bypass initialization returns a Site B handoff without provider fields
       amountMinor: 7000,
       currency: 'GHS',
       purpose: 'KYC_BYPASS',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' },
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' },
       returnUrl: 'http://127.0.0.1:3000/?kyc_bypass_reference=withdrawal_001'
     });
     const response = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
@@ -482,7 +569,7 @@ test('repeated initialization reuses the existing pending transaction and handof
       amountMinor: 18000,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const first = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
       method: 'POST',
@@ -515,7 +602,7 @@ test('provider initialization failure leaves a durable recoverable transaction a
       amountMinor: 4200,
       currency: 'GHS',
       purpose: 'WALLET_TOPUP',
-      customer: { email: 'bridgetfegerson2007+1@gmail.com' }
+      customer: { email: 'bridgetfegerson2007+11@gmail.com' }
     });
     const first = await fetch(`${fixture.base}/api/v1/payments/initialize`, {
       method: 'POST',
@@ -523,6 +610,10 @@ test('provider initialization failure leaves a durable recoverable transaction a
       body
     });
     assert.equal(first.status, 502);
+    const firstResult = await Promise.resolve(first.clone()).then(response => response.json());
+    assert.equal(firstResult.code, 'PAYSTACK_INITIALIZATION_FAILED');
+    assert.equal(firstResult.requestId, 'site-a-init-failure-1');
+    assert.match(firstResult.error, /could not be initialized/i);
     const firstStored = JSON.parse(fs.readFileSync(fixture.dataFile, 'utf8')).transactions.find(item => item.siteATransactionId === 'PH-TOPUP-INIT-001');
     assert.equal(firstStored.status, 'INITIALIZING');
     assert.match(firstStored.paystackReference, /^SBP_[A-Za-z0-9]+$/);
@@ -699,6 +790,20 @@ test('previously failed transactions can be rechecked and promoted after Paystac
   }
 });
 
+test('abandoned Paystack payments become terminal failures and notify Site A once', async () => {
+  const stored = transaction();
+  const fixture = await startFixture({ storedTransaction: stored, paystackPayment: paystackPayment(stored, { status: 'abandoned' }) });
+  try {
+    const result = await request(fixture.base, JSON.stringify({ siteATransactionId: stored.siteATransactionId }));
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.status, 'FAILED');
+    assert.equal(fixture.callbacks.length, 1);
+    assert.equal(fixture.callbacks[0].body.event, 'wallet_topup.failed');
+  } finally {
+    await fixture.stop();
+  }
+});
+
 test('duplicate admin reconciliation verifies again but does not duplicate callbacks or payments', async () => {
   const stored = transaction();
   const fixture = await startFixture({ storedTransaction: stored, paystackPayment: paystackPayment(stored) });
@@ -712,6 +817,28 @@ test('duplicate admin reconciliation verifies again but does not duplicate callb
     assert.equal(second.body.status, 'SUCCESS');
     assert.equal(fixture.callbacks.length, 1);
     assert.equal(fixture.initializeRequests.length, 0);
+  } finally {
+    await fixture.stop();
+  }
+});
+
+test('Paystack webhook signature, reconciliation, and duplicate delivery are enforced', async () => {
+  const stored = transaction();
+  const fixture = await startFixture({ storedTransaction: stored, paystackPayment: paystackPayment(stored) });
+  try {
+    const event = { id: 'evt_webhook_success_1', event: 'charge.success', data: paystackPayment(stored) };
+    const raw = JSON.stringify(event);
+    const signature = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(raw).digest('hex');
+    const invalid = await fetch(`${fixture.base}/api/v1/webhooks/paystack`, { method: 'POST', headers: { 'x-paystack-signature': '0'.repeat(128), 'content-type': 'application/json' }, body: raw });
+    assert.equal(invalid.status, 401);
+    const first = await fetch(`${fixture.base}/api/v1/webhooks/paystack`, { method: 'POST', headers: { 'x-paystack-signature': signature, 'content-type': 'application/json' }, body: raw });
+    assert.equal(first.status, 200);
+    const duplicate = await fetch(`${fixture.base}/api/v1/webhooks/paystack`, { method: 'POST', headers: { 'x-paystack-signature': signature, 'content-type': 'application/json' }, body: raw });
+    assert.equal(duplicate.status, 200);
+    assert.deepEqual(await duplicate.json(), { ok: true, duplicate: true });
+    const saved = JSON.parse(fs.readFileSync(fixture.dataFile, 'utf8')).transactions[0];
+    assert.equal(saved.status, 'SUCCESS');
+    assert.equal(fixture.callbacks.length, 1);
   } finally {
     await fixture.stop();
   }
