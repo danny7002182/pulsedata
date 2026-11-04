@@ -2,7 +2,13 @@ const http=require('node:http'),crypto=require('node:crypto'),fs=require('node:f
 const { createBundleRoute, handleBundleWebhook } = require('./bundle-service');
 const bundleRoute = createBundleRoute({
   getBase: () => normalizeBase(process.env.SITE_B_BASE_URL || `http://127.0.0.1:${process.env.PORT || 4000}`),
-  pay: (...args) => pay(...args)
+  pay: (...args) => pay(...args),
+  getConfig: () => ({
+    siteBBaseConfigured: Boolean(cleanEnv(process.env.SITE_B_BASE_URL)),
+    requireHttps: String(cleanEnv(process.env.NODE_ENV)).toLowerCase() === 'production',
+    paystackConfigured: Boolean(KEY),
+    paystackApiConfigured: validHttpBase(API)
+  })
 });
 function servePublicSite(r,pathname){
   const files={'/':'index.html','/index.html':'index.html','/styles.css':'styles.css','/app.js':'app.js'};

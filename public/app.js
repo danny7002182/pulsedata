@@ -85,7 +85,10 @@
         body: JSON.stringify({ network, sizeGb: selectedPlan.sizeGb, recipient })
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok || !data.handoffUrl) throw new Error(data.error || 'Checkout could not be started.');
+      if (!response.ok || !data.handoffUrl) {
+        const supportCode = data.requestId ? ` Support code: ${data.requestId}.` : '';
+        throw new Error(`${data.error || 'Checkout could not be started.'}${supportCode}`);
+      }
       location.assign(data.handoffUrl);
     } catch (error) {
       showToast(error.message || 'Checkout could not be started.');

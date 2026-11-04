@@ -119,6 +119,17 @@ function paymentError(res, status, code, message, correlationId) {
   return json(res, status, { error: message, code, requestId: correlationId });
 }
 
+function validSiteBase(value, requireHttps = false) {
+  try {
+    const parsed = new URL(String(value || ''));
+    return (!requireHttps || parsed.protocol === 'https:')
+      && ['http:', 'https:'].includes(parsed.protocol)
+      && !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
+  } catch {
+    return false;
+  }
+}
+
 function matchingPayment(order, payment) {
   const metadata = payment.metadata || {};
   return payment.reference === order.paystackReference
@@ -128,7 +139,7 @@ function matchingPayment(order, payment) {
     && metadata.orderReference === order.reference;
 }
 
-function createBundleRoute({ getBase, pay }) {
+function createBundleRoute({ getBase, pay, getConfig = () => ({}) }) {
   return async function bundleRoute(req, res) {
     const url = new URL(req.url, getBase());
     const pathname = url.pathname;
@@ -173,7 +184,16 @@ function createBundleRoute({ getBase, pay }) {
       const details = networkOrder(body);
       if (!details) return json(res, 400, { error: 'Choose a valid network, bundle size, and Ghana recipient number.' });
       const email = String(process.env.DATA_BUNDLE_PAYMENT_EMAIL || 'danny700218+1@gmail.com').trim().toLowerCase();
-      if (!validEmail(email)) return json(res, 503, { error: 'Bundle payment email is not configured.' });
+      const config = getConfig() || {};
+      const configIssues = [];
+      if (config.siteBBaseConfigured === false || !validSiteBase(getBase(), Boolean(config.requireHttps))) configIssues.push('SITE_B_BASE_URL');
+      if (config.paystackConfigured === false) configIssues.push('PAYSTACK_SECRET_KEY');
+      if (config.paystackApiConfigured === false) configIssues.push('PAYSTACK_API_BASE_URL');
+      if (configIssues.length) {
+        console.error('[bundle-payment]', JSON.stringify({ event: 'configuration_failure', code: 'PAYMENT_SERVICE_NOT_CONFIGURED', requestId: correlationId, fields: configIssues }));
+        return paymentError(res, 503, 'PAYMENT_SERVICE_NOT_CONFIGURED', 'Secure checkout is temporarily unavailable. Please try again later.', correlationId);
+      }
+      if (!validEmail(email)) return paymentError(res, 503, 'BUNDLE_PAYMENT_EMAIL_NOT_CONFIGURED', 'Secure checkout is temporarily unavailable. Please try again later.', correlationId);
       const reference = makeId('BNDL');
       const paystackReference = makeId('PBD');
       const handoffToken = makeOpaqueToken();
@@ -206,7 +226,10 @@ function createBundleRoute({ getBase, pay }) {
         order.initializationError = String(error?.message || 'Bundle payment could not be initialized.').slice(0, 240);
         saveStore(store);
         console.error('[bundle-payment]', JSON.stringify({ event: 'payment_failure', code: 'PAYSTACK_INITIALIZATION_FAILED', requestId: correlationId, orderReference: reference, message: order.initializationError }));
-        return paymentError(res, 502, 'PAYSTACK_INITIALIZATION_FAILED', 'Payment checkout could not be initialized. Your order was preserved for recovery.', correlationId);
+        const code = String(error?.message || '').toLowerCase().includes('not configured')
+          ? 'PAYMENT_SERVICE_NOT_CONFIGURED'
+          : 'PAYSTACK_INITIALIZATION_FAILED';
+        return paymentError(res, 502, code, 'Payment checkout could not be initialized. Your order was preserved for recovery.', correlationId);
       }
     }
 

@@ -91,3 +91,96 @@ test('bundle checkout calculates Ghana network pricing and reconciles a paid ord
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('bundle checkout fails closed with a correlated configuration error', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-bundles-config-'));
+  const dataFile = path.join(tempDir, 'orders.json');
+  const previousFile = process.env.DATA_BUNDLE_DATA_FILE;
+  process.env.DATA_BUNDLE_DATA_FILE = dataFile;
+  let payCalls = 0;
+  const route = createBundleRoute({
+    getBase: () => 'https://data.example.test',
+    getConfig: () => ({ siteBBaseConfigured: false, requireHttps: true, paystackConfigured: false, paystackApiConfigured: false }),
+    pay: async () => { payCalls += 1; return {}; }
+  });
+
+  try {
+    const result = response();
+    await route(request('POST', '/api/v1/data-bundles/initialize', JSON.stringify({ network: 'mtn', sizeGb: 1, recipient: '0240000000' })), result);
+    const body = JSON.parse(result.body);
+    assert.equal(result.status, 503);
+    assert.equal(body.code, 'PAYMENT_SERVICE_NOT_CONFIGURED');
+    assert.match(body.requestId, /^req_/);
+    assert.equal(payCalls, 0);
+    assert.equal(fs.existsSync(dataFile), false);
+  } finally {
+    if (previousFile === undefined) delete process.env.DATA_BUNDLE_DATA_FILE;
+    else process.env.DATA_BUNDLE_DATA_FILE = previousFile;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('bundle Paystack initialization failure preserves a recoverable order', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-bundles-failure-'));
+  const dataFile = path.join(tempDir, 'orders.json');
+  const previousFile = process.env.DATA_BUNDLE_DATA_FILE;
+  process.env.DATA_BUNDLE_DATA_FILE = dataFile;
+  const route = createBundleRoute({
+    getBase: () => 'https://data.example.test',
+    getConfig: () => ({ siteBBaseConfigured: true, requireHttps: true, paystackConfigured: true, paystackApiConfigured: true }),
+    pay: async () => { throw new Error('Paystack request failed.'); }
+  });
+
+  try {
+    const result = response();
+    const requestValue = 'bundle-init-failure-1';
+    const stream = request('POST', '/api/v1/data-bundles/initialize', JSON.stringify({ network: 'mtn', sizeGb: 1, recipient: '0240000000' }));
+    stream.headers['x-request-id'] = requestValue;
+    await route(stream, result);
+    const body = JSON.parse(result.body);
+    const order = JSON.parse(fs.readFileSync(dataFile, 'utf8')).orders[0];
+    assert.equal(result.status, 502);
+    assert.equal(body.code, 'PAYSTACK_INITIALIZATION_FAILED');
+    assert.equal(body.requestId, requestValue);
+    assert.equal(body.handoffUrl, undefined);
+    assert.equal(order.paymentStatus, 'INITIALIZATION_FAILED');
+    assert.equal(order.status, 'PAYMENT_INITIALIZATION_FAILED');
+    assert.equal(order.authorizationUrl, undefined);
+  } finally {
+    if (previousFile === undefined) delete process.env.DATA_BUNDLE_DATA_FILE;
+    else process.env.DATA_BUNDLE_DATA_FILE = previousFile;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('bundle handoff rejects invalid and expired opaque tokens', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-bundles-expiry-'));
+  const dataFile = path.join(tempDir, 'orders.json');
+  const previousFile = process.env.DATA_BUNDLE_DATA_FILE;
+  process.env.DATA_BUNDLE_DATA_FILE = dataFile;
+  const route = createBundleRoute({
+    getBase: () => 'https://data.example.test',
+    getConfig: () => ({ siteBBaseConfigured: true, requireHttps: true, paystackConfigured: true, paystackApiConfigured: true }),
+    pay: async () => ({ authorization_url: 'https://checkout.paystack.com/test' })
+  });
+
+  try {
+    const invalid = response();
+    await route(request('GET', '/data/payment/handoff?token=bad'), invalid);
+    assert.equal(invalid.status, 404);
+
+    const initialized = response();
+    await route(request('POST', '/api/v1/data-bundles/initialize', JSON.stringify({ network: 'mtn', sizeGb: 1, recipient: '0240000000' })), initialized);
+    const handoffUrl = JSON.parse(initialized.body).handoffUrl;
+    const store = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+    store.orders[0].expiresAt = new Date(Date.now() - 1000).toISOString();
+    fs.writeFileSync(dataFile, JSON.stringify(store));
+    const expired = response();
+    await route(request('GET', new URL(handoffUrl).pathname + new URL(handoffUrl).search), expired);
+    assert.equal(expired.status, 410);
+  } finally {
+    if (previousFile === undefined) delete process.env.DATA_BUNDLE_DATA_FILE;
+    else process.env.DATA_BUNDLE_DATA_FILE = previousFile;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
